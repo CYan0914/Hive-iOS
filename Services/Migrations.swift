@@ -1,7 +1,7 @@
 import Foundation
 
 enum Migrations {
-    static let currentVersion = 1
+    static let currentVersion = 2
 
     static func migrate(_ database: Database) throws {
         try database.execute("""
@@ -18,6 +18,9 @@ enum Migrations {
 
         if version < 1 {
             try applyVersion1(database)
+        }
+        if version < 2 {
+            try applyVersion2(database)
         }
 
         try database.run(
@@ -94,6 +97,21 @@ enum Migrations {
             updated_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_steps_run ON steps(run_id, seq);
+        """)
+    }
+
+    /// P1: the shared blackboard. Structured, keyed, scoped to one run — as
+    /// opposed to `memory`, which is a similarity-searched pile of prose.
+    private static func applyVersion2(_ database: Database) throws {
+        try database.execute("""
+        CREATE TABLE IF NOT EXISTS blackboard (
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            author TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (run_id, key)
+        );
         """)
     }
 }

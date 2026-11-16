@@ -404,6 +404,75 @@ final class Store {
         try steps(runID: runID).last
     }
 
+    func step(runID: String, seq: Int) throws -> AgentStep? {
+        try db.query(
+            """
+            SELECT id, run_id, seq, kind, state, payload, result, error, created_at, updated_at
+            FROM steps WHERE run_id = ? AND seq = ? LIMIT 1
+            """,
+            [.text(runID), .int(seq)]
+        ) { row in
+            AgentStep(
+                id: row.string(0),
+                runID: row.string(1),
+                seq: row.int(2),
+                kind: StepKind(rawValue: row.string(3)) ?? .llm,
+                state: StepState(rawValue: row.string(4)) ?? .pending,
+                payload: row.string(5),
+                result: row.optionalString(6),
+                error: row.optionalString(7),
+                createdAt: date(row.double(8)),
+                updatedAt: date(row.double(9))
+            )
+        }.first
+    }
+
+    /// Returns the existing row for `(runID, seq)` or creates it. This is what
+    /// makes resume cheap: a replayed run re-walks the same sequence and every
+    /// finished step is handed back instead of re-executed.
+    func ensureStep(runID: String, seq: Int, kind: StepKind, payload: String) throws -> AgentStep {
+        if let existing = try step(runID: runID, seq: seq) {
+            return existing
+        }
+        let created = AgentStep(runID: runID, seq: seq, kind: kind, payload: payload)
+        try createStep(created)
+        return created
+    }
+
+    // MARK: - Blackboard
+
+    func blackboardSet(runID: String, key: String, value: String, author: String) throws {
+        try db.run(
+            """
+            INSERT OR REPLACE INTO blackboard (run_id, key, value, author, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [.text(runID), .text(key), .text(value), .text(author), timestamp(Date())]
+        )
+    }
+
+    func blackboardEntries(runID: String) throws -> [BlackboardEntry] {
+        try db.query(
+            "SELECT key, value, author, updated_at FROM blackboard WHERE run_id = ? ORDER BY updated_at ASC",
+            [.text(runID)]
+        ) { row in
+            BlackboardEntry(
+                key: row.string(0),
+                value: row.string(1),
+                author: row.string(2),
+                updatedAt: date(row.double(3))
+            )
+        }
+    }
+
+    func blackboardSnapshot(runID: String) throws -> String {
+        let entries = try blackboardEntries(runID: runID)
+        guard !entries.isEmpty else { return "" }
+        return entries
+            .map { "[\($0.key) · \($0.author)]\n\($0.value)" }
+            .joined(separator: "\n\n")
+    }
+
     /// A step left in `running` means the process died mid-call. Nothing can be
     /// trusted about it, so it is reset and replayed.
     func resetRunningSteps() throws {

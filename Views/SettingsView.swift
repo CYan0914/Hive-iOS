@@ -54,6 +54,23 @@ struct SettingsView: View {
             }
 
             Section {
+                ForEach(AgentProfile.builtins) { profile in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(profile.name)
+                            .font(.system(size: 15, weight: .medium))
+                        Text(profile.role)
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                    .listRowBackground(Theme.surface)
+                }
+            } header: {
+                Text("子机器人")
+            } footer: {
+                Text("P1 内置三个，主管家会按任务自动派活。自定义子机器人在 P2。")
+            }
+
+            Section {
                 HStack {
                     Text("向量检索")
                     Spacer()

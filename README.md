@@ -2,23 +2,25 @@
 
 一个「主管家 + 子机器人 + 共享记忆 + 自由换模型」的 iOS App。当前是 **P0**：先把地基跑通。
 
-## P0 做了什么
+## 已实现（P0 + P1）
 
-- **可中断续跑的编排**：每次模型调用是一个 `steps` 行，调用前写 `running`，完成后写 `done`。App 被挂起或杀掉后重开，发现残留的 `running` 步骤就重置为 `pending` 并重放。用户主动取消写 `cancelled`，不会被自动复活
+- **可中断续跑的编排**：每次模型调用是一个 `steps` 行，调用前写 `running`，完成后写 `done`。App 被挂起或杀掉后重开，残留的 `running` 重置为 `pending` 并重放。用户主动取消写 `cancelled`，不会被自动复活
+- **多步流水线**：主管家先产出 JSON 任务列表（`seq 0`），子机器人按顺序执行（`seq 1..n`），主管家汇总（`seq n+1`）。恢复时 `ensureStep` 直接返回已完成的步骤，不会重复调用模型
+- **黑板**：run 级 key-value。子机器人执行前读快照，完成后写回，后面的子机器人能看到前面的产出
+- **三个内置子机器人**：研究员 / 写手 / 审稿人。规划失败或模型不会输出 JSON 时自动退回「管家直接回答」
 - **三层共享记忆 + 私有区**：`semantic`（全局事实）、`episodic`（会话情节）、`blackboard`（预留）、`scratchpad`（不参与检索）。按需检索 top-k 注入 system prompt，不是全量塞上下文
 - **混合 embedding**：远程 OpenAI 兼容 `/embeddings` → Apple `NLEmbedding` 端上模型 → 关键词 LIKE 兜底
 - **三家模型协议**：OpenAI 兼容 / Anthropic / Gemini，流式。Base URL 可填任意中转或自建服务
 - **Keychain**：API Key 只进 Keychain，不进 SQLite
 - **本地 SQLite**：零第三方依赖，系统 `libsqlite3`
 
-## 还没做（P1/P2）
+## 还没做（P2）
 
-- 总管真正拆任务、派发给多个子机器人（当前所有工作由主管家自己完成）
-- 子机器人之间的事件总线与黑板并发写
+- 子机器人并行执行与事件总线（当前顺序执行，为 iOS 后台恢复的确定性让路）
 - 本地编排服务（Mac/PC 跑引擎，iPhone 只做 UI）
 - 工具调用 / MCP / 快捷指令
 - 记忆提炼与冲突消解（当前只写原始对话）
-- 自定义子机器人
+- 自定义子机器人（P1 刻意只给内置三个）
 
 ## 构建
 
@@ -45,13 +47,15 @@ Core/
   Keychain.swift           API Key 存取
 Models/
   Models.swift             领域模型、Run/Step 状态机类型
+  AgentModels.swift        子机器人与任务计划
 Services/
   Database.swift           零依赖 SQLite 封装
-  Migrations.swift         schema v1
+  Migrations.swift         schema v1 + v2（黑板）
   Store.swift              全部持久化
   Embedding.swift          远程 / Apple / 混合
   MemoryService.swift      写入与相似度检索
-  Orchestrator.swift       可恢复的步骤状态机
+  PlanParser.swift         宽容的任务计划 JSON 解析
+  Orchestrator.swift       规划 → 子机器人 → 汇总，每步可恢复
   AppEnvironment.swift     依赖装配与用户配置
   LLM/
     LLMKit.swift           请求类型、SSE、错误

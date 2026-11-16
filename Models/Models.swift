@@ -220,16 +220,20 @@ enum RunState: String, Codable {
 }
 
 enum StepKind: String, Codable {
+    case plan
     case llm
     case tool
     case memory
+    case aggregate
     case finish
 
     var displayName: String {
         switch self {
+        case .plan: return "任务拆解"
         case .llm: return "模型调用"
         case .tool: return "工具调用"
         case .memory: return "记忆写入"
+        case .aggregate: return "汇总回答"
         case .finish: return "结束"
         }
     }

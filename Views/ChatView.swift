@@ -51,8 +51,19 @@ struct ChatView: View {
                     }
 
                     if orchestrator.isRunning {
-                        StreamingBubble(text: orchestrator.streamingText)
-                            .id("streaming")
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                Text(orchestrator.currentActivity ?? "执行中…")
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.textSecondary)
+                            }
+                            .padding(.leading, 4)
+
+                            StreamingBubble(text: orchestrator.streamingText)
+                        }
+                        .id("streaming")
                     }
 
                     if let error = orchestrator.lastError, !orchestrator.isRunning {
