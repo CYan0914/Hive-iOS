@@ -1,0 +1,78 @@
+# XcodeGen spec. `xcodegen generate` writes Hive.xcodeproj from this file.
+#
+# The .xcodeproj is generated, never committed: this file is the single source
+# of truth for build settings, same as the other iOS projects on this machine.
+name: Hive
+options:
+  bundleIdPrefix: com.cyan0914
+  deploymentTarget:
+    iOS: "17.0"
+  minimumXcodeGenVersion: 2.40
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    ALWAYS_SEARCH_USER_PATHS: NO
+    DEVELOPMENT_TEAM: H4VQ9X6KYK
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1,2"
+
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+    Release:
+      SWIFT_COMPILATION_MODE: wholemodule
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+
+targets:
+  Hive:
+    type: application
+    platform: iOS
+    sources:
+      - path: HiveApp.swift
+      - path: Core
+      - path: Models
+      - path: Services
+      - path: Views
+      # Resources/Info.plist is referenced through INFOPLIST_FILE, so it is not
+      # a compile source. Listing the directory here would add an empty group.
+    dependencies:
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_NAME: Hive
+        PRODUCT_BUNDLE_IDENTIFIER: com.cyan0914.hive
+        INFOPLIST_FILE: Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+
+  HiveTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: Hive
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cyan0914.hive.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  Hive:
+    build:
+      targets:
+        Hive: all
+        HiveTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - HiveTests
+    archive:
+      config: Release
