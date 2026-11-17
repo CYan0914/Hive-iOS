@@ -14,7 +14,12 @@ concurrency:
 jobs:
   build:
     name: Build and test for iOS Simulator
-    runs-on: macos-latest
+    # Intel pool on purpose. Two consecutive runs died after 15 minutes in the
+    # arm64 queue ("job was not acquired by Runner of type hosted") without
+    # compiling a single line. Intel runners have far more capacity, and an
+    # Xcode 15/16 toolchain is enough for an iOS 17 target — nothing here needs
+    # Xcode 26.
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout
