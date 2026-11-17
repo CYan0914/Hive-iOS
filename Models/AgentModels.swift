@@ -11,9 +11,23 @@ struct AgentProfile: Identifiable, Codable, Equatable {
     var providerID: String?
     var model: String?
     var isBuiltin: Bool
+    /// Tool names this agent may use. Empty means "no tools", which is a
+    /// permission, not a bug.
+    var allowedTools: [String]
 }
 
 extension AgentProfile {
+    static let supervisor = AgentProfile(
+        id: "supervisor",
+        name: "管家",
+        role: "supervisor",
+        systemPrompt: "",
+        providerID: nil,
+        model: nil,
+        isBuiltin: true,
+        allowedTools: ["http_request", "extract_text"]
+    )
+
     static let builtins: [AgentProfile] = [
         AgentProfile(
             id: "researcher",
@@ -23,13 +37,14 @@ extension AgentProfile {
             你是一名研究员。你的职责是整理与任务相关的事实、线索和已知信息。
 
             要求：
-            - 只陈述你有把握的内容，不确定的地方明确写"不确定"
-            - 不要编造数据、来源、日期
+            - 需要外部信息时使用工具，不要凭记忆编造数据、来源、日期
+            - 工具失败或没有信息时，明确说"未能获取"
             - 用紧凑的要点输出，不要写寒暄或过程描述
             """,
             providerID: nil,
             model: nil,
-            isBuiltin: true
+            isBuiltin: true,
+            allowedTools: ["http_request", "extract_text"]
         ),
         AgentProfile(
             id: "writer",
@@ -45,7 +60,8 @@ extension AgentProfile {
             """,
             providerID: nil,
             model: nil,
-            isBuiltin: true
+            isBuiltin: true,
+            allowedTools: []
         ),
         AgentProfile(
             id: "critic",
@@ -61,12 +77,14 @@ extension AgentProfile {
             """,
             providerID: nil,
             model: nil,
-            isBuiltin: true
+            isBuiltin: true,
+            allowedTools: []
         )
     ]
 
     static func find(_ id: String) -> AgentProfile? {
-        builtins.first { $0.id == id }
+        if id == supervisor.id { return supervisor }
+        return builtins.first { $0.id == id }
     }
 }
 

@@ -13,6 +13,91 @@ final class OpenAICompatibleProvider: LLMProvider {
 
     var displayName: String { config.name }
 
+    // MARK: - Encoding
+
+    private func encodedMessages(_ request: LLMRequest) -> [[String: Any]] {
+        var messages: [[String: Any]] = []
+        if let system = request.system, !system.isEmpty {
+            messages.append(["role": "system", "content": system])
+        }
+
+        for message in request.messages {
+            switch message.role {
+            case .tool:
+                messages.append([
+                    "role": "tool",
+                    "tool_call_id": message.toolCallID ?? "",
+                    "content": message.content
+                ])
+            case .assistant where !message.toolCalls.isEmpty:
+                messages.append([
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": message.toolCalls.map { call in
+                        [
+                            "id": call.id,
+                            "type": "function",
+                            "function": [
+                                "name": call.name,
+                                "arguments": OpenAICompatibleProvider.argumentsJSON(call.arguments)
+                            ]
+                        ] as [String: Any]
+                    }
+                ])
+            default:
+                let role: String
+                switch message.role {
+                case .system: role = "system"
+                case .assistant: role = "assistant"
+                default: role = "user"
+                }
+                messages.append(["role": role, "content": message.content])
+            }
+        }
+        return messages
+    }
+
+    private static func toolPayload(_ tool: ToolDefinition) -> [String: Any] {
+        var properties: [String: Any] = [:]
+        for (key, value) in tool.schema.properties {
+            properties[key] = ["type": value.type, "description": value.description]
+        }
+        return [
+            "type": "function",
+            "function": [
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": [
+                    "type": tool.schema.type,
+                    "properties": properties,
+                    "required": tool.schema.required
+                ]
+            ]
+        ]
+    }
+
+    private static func argumentsJSON(_ arguments: [String: String]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: arguments),
+              let text = String(data: data, encoding: .utf8) else { return "{}" }
+        return text
+    }
+
+    private static func parseArguments(_ raw: String) -> [String: String] {
+        guard let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        var result: [String: String] = [:]
+        for (key, value) in object {
+            if let string = value as? String {
+                result[key] = string
+            } else {
+                result[key] = String(describing: value)
+            }
+        }
+        return result
+    }
+
     func stream(_ request: LLMRequest) async throws -> AsyncThrowingStream<LLMEvent, Error> {
         let url = try ProviderSupport.openAIChatURL(base: config.baseURL)
         var urlRequest = URLRequest(url: url)
@@ -21,22 +106,17 @@ final class OpenAICompatibleProvider: LLMProvider {
         urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-        var messages: [[String: Any]] = []
-        if let system = request.system, !system.isEmpty {
-            messages.append(["role": "system", "content": system])
-        }
-        for message in request.messages {
-            let role = message.role == .assistant ? "assistant" : (message.role == .system ? "system" : "user")
-            messages.append(["role": role, "content": message.content])
-        }
-
-        let body: [String: Any] = [
+        let messages = encodedMessages(request)
+        var body: [String: Any] = [
             "model": request.model,
             "messages": messages,
             "stream": true,
             "temperature": request.temperature,
             "max_tokens": request.maxTokens
         ]
+        if !request.tools.isEmpty {
+            body["tools"] = request.tools.map { OpenAICompatibleProvider.toolPayload($0) }
+        }
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (bytes, response) = try await HTTPClient.session.bytes(for: urlRequest)
@@ -45,6 +125,11 @@ final class OpenAICompatibleProvider: LLMProvider {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    // Tool call fragments arrive across chunks: id and name
+                    // once, arguments in pieces. Keyed by `index` because more
+                    // than one call can be in flight.
+                    var toolAccumulators: [Int: (id: String, name: String, arguments: String)] = [:]
+
                     for try await event in SSE.events(from: bytes) {
                         if event.data == "[DONE]" {
                             continuation.finish()
@@ -56,11 +141,42 @@ final class OpenAICompatibleProvider: LLMProvider {
                         else { continue }
 
                         if let choices = object["choices"] as? [[String: Any]],
-                           let delta = choices.first?["delta"] as? [String: Any],
-                           let text = delta["content"] as? String,
-                           !text.isEmpty {
-                            continuation.yield(.text(text))
+                           let delta = choices.first?["delta"] as? [String: Any] {
+                            if let text = delta["content"] as? String, !text.isEmpty {
+                                continuation.yield(.text(text))
+                            }
+                            if let fragments = delta["tool_calls"] as? [[String: Any]] {
+                                for fragment in fragments {
+                                    let index = fragment["index"] as? Int ?? 0
+                                    var accumulator = toolAccumulators[index] ?? (id: "", name: "", arguments: "")
+                                    if let id = fragment["id"] as? String, !id.isEmpty {
+                                        accumulator.id = id
+                                    }
+                                    if let function = fragment["function"] as? [String: Any] {
+                                        if let name = function["name"] as? String, !name.isEmpty {
+                                            accumulator.name = name
+                                        }
+                                        if let arguments = function["arguments"] as? String {
+                                            accumulator.arguments += arguments
+                                        }
+                                    }
+                                    toolAccumulators[index] = accumulator
+                                }
+                            }
                         }
+                    }
+
+                    let calls = toolAccumulators.keys.sorted().compactMap { index -> ToolCall? in
+                        guard let accumulator = toolAccumulators[index],
+                              !accumulator.name.isEmpty else { return nil }
+                        return ToolCall(
+                            id: accumulator.id.isEmpty ? UUID().uuidString : accumulator.id,
+                            name: accumulator.name,
+                            arguments: OpenAICompatibleProvider.parseArguments(accumulator.arguments)
+                        )
+                    }
+                    if !calls.isEmpty {
+                        continuation.yield(.toolCalls(calls))
                     }
                     continuation.finish()
                 } catch {

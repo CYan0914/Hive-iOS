@@ -341,13 +341,15 @@ final class Store {
     func createStep(_ step: AgentStep) throws {
         try db.run(
             """
-            INSERT INTO steps (id, run_id, seq, kind, state, payload, result, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO steps
+                (id, run_id, seq, step_key, kind, state, payload, result, error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(step.id),
                 .text(step.runID),
                 .int(step.seq),
+                step.stepKey.isEmpty ? .null : .text(step.stepKey),
                 .text(step.kind.rawValue),
                 .text(step.state.rawValue),
                 .text(step.payload),
@@ -380,7 +382,7 @@ final class Store {
     func steps(runID: String) throws -> [AgentStep] {
         try db.query(
             """
-            SELECT id, run_id, seq, kind, state, payload, result, error, created_at, updated_at
+            SELECT id, run_id, seq, step_key, kind, state, payload, result, error, created_at, updated_at
             FROM steps WHERE run_id = ? ORDER BY seq ASC
             """,
             [.text(runID)]
@@ -389,13 +391,14 @@ final class Store {
                 id: row.string(0),
                 runID: row.string(1),
                 seq: row.int(2),
-                kind: StepKind(rawValue: row.string(3)) ?? .llm,
-                state: StepState(rawValue: row.string(4)) ?? .pending,
-                payload: row.string(5),
-                result: row.optionalString(6),
-                error: row.optionalString(7),
-                createdAt: date(row.double(8)),
-                updatedAt: date(row.double(9))
+                stepKey: row.optionalString(3) ?? "",
+                kind: StepKind(rawValue: row.string(4)) ?? .llm,
+                state: StepState(rawValue: row.string(5)) ?? .pending,
+                payload: row.string(6),
+                result: row.optionalString(7),
+                error: row.optionalString(8),
+                createdAt: date(row.double(9)),
+                updatedAt: date(row.double(10))
             )
         }
     }
@@ -407,7 +410,7 @@ final class Store {
     func step(runID: String, seq: Int) throws -> AgentStep? {
         try db.query(
             """
-            SELECT id, run_id, seq, kind, state, payload, result, error, created_at, updated_at
+            SELECT id, run_id, seq, step_key, kind, state, payload, result, error, created_at, updated_at
             FROM steps WHERE run_id = ? AND seq = ? LIMIT 1
             """,
             [.text(runID), .int(seq)]
@@ -416,15 +419,48 @@ final class Store {
                 id: row.string(0),
                 runID: row.string(1),
                 seq: row.int(2),
-                kind: StepKind(rawValue: row.string(3)) ?? .llm,
-                state: StepState(rawValue: row.string(4)) ?? .pending,
-                payload: row.string(5),
-                result: row.optionalString(6),
-                error: row.optionalString(7),
-                createdAt: date(row.double(8)),
-                updatedAt: date(row.double(9))
+                stepKey: row.optionalString(3) ?? "",
+                kind: StepKind(rawValue: row.string(4)) ?? .llm,
+                state: StepState(rawValue: row.string(5)) ?? .pending,
+                payload: row.string(6),
+                result: row.optionalString(7),
+                error: row.optionalString(8),
+                createdAt: date(row.double(9)),
+                updatedAt: date(row.double(10))
             )
         }.first
+    }
+
+    func step(runID: String, key: String) throws -> AgentStep? {
+        try db.query(
+            """
+            SELECT id, run_id, seq, step_key, kind, state, payload, result, error, created_at, updated_at
+            FROM steps WHERE run_id = ? AND step_key = ? LIMIT 1
+            """,
+            [.text(runID), .text(key)]
+        ) { row in
+            AgentStep(
+                id: row.string(0),
+                runID: row.string(1),
+                seq: row.int(2),
+                stepKey: row.optionalString(3) ?? "",
+                kind: StepKind(rawValue: row.string(4)) ?? .llm,
+                state: StepState(rawValue: row.string(5)) ?? .pending,
+                payload: row.string(6),
+                result: row.optionalString(7),
+                error: row.optionalString(8),
+                createdAt: date(row.double(9)),
+                updatedAt: date(row.double(10))
+            )
+        }.first
+    }
+
+    func nextStepSeq(runID: String) throws -> Int {
+        let maximum = try db.query(
+            "SELECT COALESCE(MAX(seq), -1) FROM steps WHERE run_id = ?",
+            [.text(runID)]
+        ) { $0.int(0) }.first ?? -1
+        return maximum + 1
     }
 
     /// Returns the existing row for `(runID, seq)` or creates it. This is what
@@ -435,6 +471,18 @@ final class Store {
             return existing
         }
         let created = AgentStep(runID: runID, seq: seq, kind: kind, payload: payload)
+        try createStep(created)
+        return created
+    }
+
+    /// P2 resume path. Keyed lookup, fresh sequence number on first create —
+    /// a replay finds the row regardless of where the tool loop put it.
+    func ensureStep(runID: String, key: String, kind: StepKind, payload: String) throws -> AgentStep {
+        if let existing = try step(runID: runID, key: key) {
+            return existing
+        }
+        let seq = try nextStepSeq(runID: runID)
+        let created = AgentStep(runID: runID, seq: seq, stepKey: key, kind: kind, payload: payload)
         try createStep(created)
         return created
     }

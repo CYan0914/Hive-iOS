@@ -1,7 +1,7 @@
 import Foundation
 
 enum Migrations {
-    static let currentVersion = 2
+    static let currentVersion = 3
 
     static func migrate(_ database: Database) throws {
         try database.execute("""
@@ -21,6 +21,9 @@ enum Migrations {
         }
         if version < 2 {
             try applyVersion2(database)
+        }
+        if version < 3 {
+            try applyVersion3(database)
         }
 
         try database.run(
@@ -112,6 +115,20 @@ enum Migrations {
             updated_at REAL NOT NULL,
             PRIMARY KEY (run_id, key)
         );
+        """)
+    }
+
+    /// P2: a stable logical key per step.
+    ///
+    /// Sequence numbers were enough while a run was one straight line. A tool
+    /// loop is not: turn 1 may contain two tool calls and turn 2 may contain
+    /// none, so the same logical step lands on a different `seq` in a replay.
+    /// Resume has to match on something the model cannot shift.
+    private static func applyVersion3(_ database: Database) throws {
+        // SQLite has no ADD COLUMN IF NOT EXISTS.
+        try? database.execute("ALTER TABLE steps ADD COLUMN step_key TEXT;")
+        try database.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_steps_key ON steps(run_id, step_key);
         """)
     }
 }

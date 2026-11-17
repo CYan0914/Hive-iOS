@@ -89,6 +89,11 @@ struct RunDetailView: View {
                                 .font(.caption2)
                                 .foregroundStyle(step.state == .failed ? Theme.danger : Theme.textSecondary)
                         }
+                        if step.kind == .tool, let summary = toolSummary(step.payload) {
+                            Text(summary)
+                                .font(.caption2)
+                                .foregroundStyle(Theme.textSecondary)
+                        }
                         if let error = step.error {
                             Text(error)
                                 .font(.caption)
@@ -124,5 +129,14 @@ struct RunDetailView: View {
 
     private func reload() {
         steps = (try? env.store.steps(runID: run.id)) ?? []
+    }
+
+    private func toolSummary(_ payload: String) -> String? {
+        guard let data = payload.data(using: .utf8),
+              let call = try? JSONDecoder().decode(ToolCall.self, from: data) else {
+            return nil
+        }
+        let argument = call.arguments["url"] ?? call.arguments.values.first ?? ""
+        return argument.isEmpty ? call.name : "\(call.name) · \(argument)"
     }
 }

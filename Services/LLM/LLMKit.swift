@@ -7,14 +7,26 @@ struct LLMMessage: Codable, Equatable {
         case system
         case user
         case assistant
+        case tool
     }
 
     let role: Role
     let content: String
+    /// Set on a `.tool` message: which call this is the result of.
+    var toolCallID: String?
+    /// Set on an `.assistant` message that asked for tools.
+    var toolCalls: [ToolCall]
 
-    init(role: Role, content: String) {
+    init(
+        role: Role,
+        content: String,
+        toolCallID: String? = nil,
+        toolCalls: [ToolCall] = []
+    ) {
         self.role = role
         self.content = content
+        self.toolCallID = toolCallID
+        self.toolCalls = toolCalls
     }
 }
 
@@ -24,10 +36,15 @@ struct LLMRequest {
     var messages: [LLMMessage]
     var temperature: Double = 0.7
     var maxTokens: Int = 2048
+    /// Empty means the provider should not be told tools exist at all.
+    var tools: [ToolDefinition] = []
 }
 
 enum LLMEvent {
     case text(String)
+    /// Emitted once per assistant turn, after the stream ends. Partial
+    /// argument fragments are accumulated inside the provider.
+    case toolCalls([ToolCall])
 }
 
 enum LLMError: Error, LocalizedError {

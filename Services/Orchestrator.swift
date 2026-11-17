@@ -1,18 +1,19 @@
 import Foundation
 import Combine
 
-/// The resumable state machine, now multi-step.
+/// The resumable state machine, now with a tool loop.
 ///
-/// A run is a fixed sequence of steps:
+/// A run is:
 ///
-///   seq 0        plan        supervisor produces a JSON task list
-///   seq 1..n     llm         one sub-agent per task, output goes to the blackboard
-///   seq n+1      aggregate   supervisor merges the contributions into an answer
+///   plan            supervisor produces a JSON task list
+///   task-0..n       one sub-agent per task; each may loop llm -> tool -> llm
+///   aggregate       supervisor merges the contributions into an answer
 ///
-/// Every step is a row written before it executes and updated when it finishes.
-/// Resume replays the same sequence and `ensureStep` hands back finished rows,
-/// so a run interrupted at step 2 picks up at step 2 — not from the beginning,
-/// and not with a duplicate model call for steps 0 and 1.
+/// Every step is a row keyed by its logical name (`task-0/turn-1/tool-0`), not
+/// by position: a tool loop changes how many rows a turn produces, so sequence
+/// numbers are not stable across a replay. `ensureStep` returns the finished
+/// row on resume, and a finished tool step is never executed twice — re-fetching
+/// a URL would give the model a different answer than the one it reasoned about.
 @MainActor
 final class Orchestrator: ObservableObject {
     @Published private(set) var isRunning = false
@@ -31,6 +32,7 @@ final class Orchestrator: ObservableObject {
 
     private enum StepOutcome {
         case text(String)
+        case toolCalls([ToolCall])
         case interrupted
         case failed(String)
     }
@@ -63,8 +65,8 @@ final class Orchestrator: ObservableObject {
         task = nil
     }
 
-    /// Called once at launch. Re-walks a run that was executing when the app
-    /// went away; finished steps are replayed from SQLite, not re-requested.
+    /// Re-walks a run that was executing when the app went away. Finished
+    /// steps come back from SQLite; only the unfinished tail is re-requested.
     func resumeInterruptedIfNeeded() {
         guard !isRunning else { return }
 
@@ -79,8 +81,6 @@ final class Orchestrator: ObservableObject {
         do {
             resolved = try resolveProvider(payload.providerID)
         } catch {
-            // The provider may have been deleted. Mark it failed rather than
-            // leaving a run that never clears.
             try? store.updateRunState(id: run.id, state: .failed)
             return
         }
@@ -188,11 +188,12 @@ final class Orchestrator: ObservableObject {
         currentActivity = "管家正在拆解任务…"
         let planOutcome = await runStep(
             run: run,
-            seq: 0,
+            key: "plan",
             kind: .plan,
             payload: basePayload,
             system: plannerPrompt(),
             messages: history,
+            tools: [],
             model: config.model,
             temperature: 0.3,
             maxTokens: 800,
@@ -210,32 +211,30 @@ final class Orchestrator: ObservableObject {
         case .failed(let message):
             finishFailed(run: run, assistantMessageID: assistantMessageID, output: streamingText, message: message)
             return
+        case .toolCalls:
+            plan = AgentPlan(rationale: "", tasks: [])
         }
 
-        // Unusable plan (or a model that cannot produce JSON): answer directly.
-        // This is the P0 path, kept as the fallback rather than an error state.
+        // Unusable plan: answer directly, with the supervisor's own tools.
         if plan.tasks.isEmpty {
             currentActivity = "管家正在回答…"
-            let direct = await runStep(
+            let direct = await runAgentLoop(
                 run: run,
-                seq: 1,
-                kind: .aggregate,
-                payload: basePayload,
+                keyPrefix: "direct",
                 system: supervisorDirectPrompt(memoryBlock: memoryBlock),
-                messages: history,
-                model: config.model,
-                temperature: config.temperature,
-                maxTokens: config.maxTokens,
+                initialMessages: history,
+                tools: ToolRegistry.tools(for: AgentProfile.supervisor),
+                providerID: providerID,
                 provider: provider,
-                streamToUI: true
+                config: config,
+                streamToUI: true,
+                maxTurns: 3
             )
             finish(direct, run: run, sessionID: sessionID, assistantMessageID: assistantMessageID, userText: userText)
             return
         }
 
-        // 2. Sub-agents, sequential. Sequential on purpose: iOS gives no
-        // background guarantee, and three parallel streams on a suspended app
-        // is three partial outputs that all have to be reconciled on resume.
+        // 2. Sub-agents, sequential.
         var contributions: [String] = []
         for (index, planned) in plan.tasks.enumerated() {
             if Task.isCancelled {
@@ -250,22 +249,17 @@ final class Orchestrator: ObservableObject {
             let blackboard = (try? store.blackboardSnapshot(runID: run.id)) ?? ""
             let taskMemory = await memory.contextBlock(query: planned.instruction, sessionID: sessionID)
 
-            let outcome = await runStep(
+            let outcome = await runAgentLoop(
                 run: run,
-                seq: index + 1,
-                kind: .llm,
-                payload: StepPayload(
-                    userText: planned.instruction,
-                    providerID: providerID,
-                    model: config.model
-                ),
+                keyPrefix: "task-\(index)",
                 system: agentPrompt(profile: profile, blackboard: blackboard, memoryBlock: taskMemory),
-                messages: [LLMMessage(role: .user, content: planned.instruction)],
-                model: config.model,
-                temperature: config.temperature,
-                maxTokens: config.maxTokens,
+                initialMessages: [LLMMessage(role: .user, content: planned.instruction)],
+                tools: ToolRegistry.tools(for: profile),
+                providerID: providerID,
                 provider: provider,
-                streamToUI: false
+                config: config,
+                streamToUI: false,
+                maxTurns: 3
             )
 
             switch outcome {
@@ -278,6 +272,12 @@ final class Orchestrator: ObservableObject {
             case .failed(let message):
                 finishFailed(run: run, assistantMessageID: assistantMessageID, output: streamingText, message: message)
                 return
+            case .toolCalls:
+                // runAgentLoop only returns this if its loop cap was reached in
+                // an unexpected state; treat it as a failure rather than
+                // silently dropping the turn.
+                finishFailed(run: run, assistantMessageID: assistantMessageID, output: streamingText, message: "子机器人在没有产出结果的情况下停止了")
+                return
             }
         }
 
@@ -285,11 +285,12 @@ final class Orchestrator: ObservableObject {
         currentActivity = "管家正在汇总…"
         let synthesis = await runStep(
             run: run,
-            seq: plan.tasks.count + 1,
+            key: "aggregate",
             kind: .aggregate,
             payload: basePayload,
             system: synthesisPrompt(userText: userText, contributions: contributions.joined(separator: "\n\n")),
             messages: history,
+            tools: [],
             model: config.model,
             temperature: config.temperature,
             maxTokens: config.maxTokens,
@@ -300,32 +301,125 @@ final class Orchestrator: ObservableObject {
         finish(synthesis, run: run, sessionID: sessionID, assistantMessageID: assistantMessageID, userText: userText)
     }
 
-    private func finish(
-        _ outcome: StepOutcome,
+    // MARK: - Agent tool loop
+
+    private func runAgentLoop(
         run: AgentRun,
-        sessionID: String,
-        assistantMessageID: String,
-        userText: String
-    ) {
-        switch outcome {
-        case .text(let text):
-            complete(run: run, sessionID: sessionID, assistantMessageID: assistantMessageID, output: text, userText: userText)
-        case .interrupted:
-            finishInterrupted(run: run, assistantMessageID: assistantMessageID, output: streamingText)
-        case .failed(let message):
-            finishFailed(run: run, assistantMessageID: assistantMessageID, output: streamingText, message: message)
+        keyPrefix: String,
+        system: String,
+        initialMessages: [LLMMessage],
+        tools: [AgentTool],
+        providerID: String,
+        provider: LLMProvider,
+        config: ProviderConfig,
+        streamToUI: Bool,
+        maxTurns: Int
+    ) async -> StepOutcome {
+        var conversation = initialMessages
+        let definitions = tools.map(\.definition)
+        let payload = StepPayload(userText: keyPrefix, providerID: providerID, model: config.model)
+
+        for turn in 0..<maxTurns {
+            if Task.isCancelled { return .interrupted }
+
+            let outcome = await runStep(
+                run: run,
+                key: "\(keyPrefix)/turn-\(turn)",
+                kind: .llm,
+                payload: payload,
+                system: system,
+                messages: conversation,
+                tools: definitions,
+                model: config.model,
+                temperature: config.temperature,
+                maxTokens: config.maxTokens,
+                provider: provider,
+                streamToUI: streamToUI
+            )
+
+            switch outcome {
+            case .text(let text):
+                return .text(text)
+            case .interrupted:
+                return .interrupted
+            case .failed(let message):
+                return .failed(message)
+            case .toolCalls(let calls):
+                currentActivity = "执行 \(calls.map(\.name).joined(separator: "、"))…"
+                conversation.append(LLMMessage(role: .assistant, content: "", toolCalls: calls))
+
+                for (index, call) in calls.enumerated() {
+                    let result = await executeTool(
+                        run: run,
+                        key: "\(keyPrefix)/turn-\(turn)/tool-\(index)",
+                        call: call
+                    )
+                    conversation.append(LLMMessage(
+                        role: .tool,
+                        content: result.output,
+                        toolCallID: call.id
+                    ))
+                }
+            }
         }
+
+        return .failed("工具调用超过 \(maxTurns) 轮，已停止")
+    }
+
+    private func executeTool(run: AgentRun, key: String, call: ToolCall) async -> ToolResult {
+        let step: AgentStep?
+        do {
+            step = try store.ensureStep(
+                runID: run.id,
+                key: key,
+                kind: .tool,
+                payload: encodeCall(call)
+            )
+        } catch {
+            step = nil
+        }
+
+        // Replay path: a finished tool call is not run again. Besides being
+        // slow, a second fetch can return different content than the one the
+        // model already reasoned about, which makes resume non-deterministic.
+        if let step, step.state == .done, let output = step.result {
+            return ToolResult(callID: call.id, name: call.name, output: output, isError: false)
+        }
+
+        if let step {
+            try? store.updateStep(id: step.id, state: .running)
+        }
+
+        let tool = ToolRegistry.find(call.name)
+        let result: ToolResult
+        if let tool {
+            result = await tool.execute(call: call)
+        } else {
+            result = ToolResult(
+                callID: call.id,
+                name: call.name,
+                output: "未知工具：\(call.name)",
+                isError: true
+            )
+        }
+
+        if let step {
+            try? store.updateStep(id: step.id, state: .done, result: result.output)
+        }
+        revision += 1
+        return result
     }
 
     // MARK: - Step execution
 
     private func runStep(
         run: AgentRun,
-        seq: Int,
+        key: String,
         kind: StepKind,
         payload: StepPayload,
         system: String?,
         messages: [LLMMessage],
+        tools: [ToolDefinition],
         model: String,
         temperature: Double,
         maxTokens: Int,
@@ -334,18 +428,18 @@ final class Orchestrator: ObservableObject {
     ) async -> StepOutcome {
         let step: AgentStep
         do {
-            step = try store.ensureStep(runID: run.id, seq: seq, kind: kind, payload: payload.json)
+            step = try store.ensureStep(runID: run.id, key: key, kind: kind, payload: payload.json)
         } catch {
             return .failed("无法创建步骤：\(error.localizedDescription)")
         }
 
-        // Resume fast path: this step already produced its output.
         if step.state == .done, let result = step.result {
-            return .text(result)
+            if let calls = StepPayloadCodec.decodeCalls(result) {
+                return .toolCalls(calls)
+            }
+            return .text(StepPayloadCodec.textOrRaw(result))
         }
 
-        // Written before the call starts. A crash here leaves a `running` row
-        // that launch recovery resets to `pending`.
         try? store.updateStep(id: step.id, state: .running)
 
         let request = LLMRequest(
@@ -353,22 +447,27 @@ final class Orchestrator: ObservableObject {
             system: system,
             messages: messages,
             temperature: temperature,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            tools: tools
         )
 
         var output = ""
+        var collected: [ToolCall] = []
         var lastFlush = Date.distantPast
 
         do {
             let stream = try await provider.stream(request)
             for try await event in stream {
                 guard !Task.isCancelled else { break }
-                if case .text(let delta) = event {
+                switch event {
+                case .text(let delta):
                     output += delta
                     if streamToUI, Date().timeIntervalSince(lastFlush) > 0.05 {
                         streamingText = output
                         lastFlush = Date()
                     }
+                case .toolCalls(let calls):
+                    collected.append(contentsOf: calls)
                 }
             }
         } catch {
@@ -385,14 +484,38 @@ final class Orchestrator: ObservableObject {
             return .interrupted
         }
 
+        if !collected.isEmpty {
+            try? store.updateStep(id: step.id, state: .done, result: StepPayloadCodec.encodeCalls(collected))
+            return .toolCalls(collected)
+        }
+
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             try? store.updateStep(id: step.id, state: .failed, error: "模型返回空内容")
             return .failed("模型返回空内容")
         }
 
-        try? store.updateStep(id: step.id, state: .done, result: trimmed)
+        try? store.updateStep(id: step.id, state: .done, result: StepPayloadCodec.encodeText(trimmed))
         return .text(trimmed)
+    }
+
+    private func finish(
+        _ outcome: StepOutcome,
+        run: AgentRun,
+        sessionID: String,
+        assistantMessageID: String,
+        userText: String
+    ) {
+        switch outcome {
+        case .text(let text):
+            complete(run: run, sessionID: sessionID, assistantMessageID: assistantMessageID, output: text, userText: userText)
+        case .interrupted:
+            finishInterrupted(run: run, assistantMessageID: assistantMessageID, output: streamingText)
+        case .failed(let message):
+            finishFailed(run: run, assistantMessageID: assistantMessageID, output: streamingText, message: message)
+        case .toolCalls:
+            finishFailed(run: run, assistantMessageID: assistantMessageID, output: streamingText, message: "汇总阶段返回了工具调用")
+        }
     }
 
     // MARK: - Terminal states
@@ -414,8 +537,6 @@ final class Orchestrator: ObservableObject {
         isRunning = false
         activeRun = nil
 
-        // Memory writes are not on the critical path; the answer is already on
-        // screen by the time this runs.
         Task { [weak self] in
             guard let self else { return }
             await self.memory.remember(content: userText, layer: .episodic, sessionID: sessionID, importance: 0.4)
@@ -426,8 +547,6 @@ final class Orchestrator: ObservableObject {
     }
 
     private func finishInterrupted(run: AgentRun, assistantMessageID: String, output: String) {
-        // The run goes terminal so a deliberate cancel is not resurrected at
-        // next launch. The step itself stays pending and replayable.
         try? store.updateRunState(id: run.id, state: .cancelled)
         try? store.updateMessage(id: assistantMessageID, content: output, status: .interrupted)
         revision += 1
@@ -449,6 +568,12 @@ final class Orchestrator: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    private func encodeCall(_ call: ToolCall) -> String {
+        guard let data = try? JSONEncoder().encode(call),
+              let text = String(data: data, encoding: .utf8) else { return "{}" }
+        return text
+    }
 
     private func payloadFor(run: AgentRun) -> StepPayload? {
         let steps = (try? store.steps(runID: run.id)) ?? []
@@ -498,7 +623,7 @@ final class Orchestrator: ObservableObject {
         你是 Hive 的主管家。把用户请求拆成 1-3 个可以独立执行的子任务。
 
         可用的子机器人（agent 字段只能填这些 id）：
-        - researcher：整理事实和信息
+        - researcher：整理事实和信息，可以联网查资料
         - writer：撰写和改写文字
         - critic：挑错和给修改建议
 
@@ -520,6 +645,9 @@ final class Orchestrator: ObservableObject {
         if !memoryBlock.isEmpty {
             parts.append("相关长期记忆：\n\(memoryBlock)")
         }
+        if let tools = profile?.allowedTools, !tools.isEmpty {
+            parts.append("你可以使用这些工具：\(tools.joined(separator: "、"))。需要外部信息时先调用工具，不要凭记忆编造。")
+        }
         parts.append("只完成分给你的任务，不要复述指令，不要输出 JSON。")
         return parts.joined(separator: "\n\n")
     }
@@ -528,6 +656,7 @@ final class Orchestrator: ObservableObject {
         var lines = [
             "你是 Hive 的主管家。",
             "直接、准确地回答用户的问题。",
+            "需要外部信息时使用工具，不要编造事实。",
             "不要声称自己执行了没有执行的操作。"
         ]
         if !memoryBlock.isEmpty {

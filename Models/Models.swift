@@ -287,6 +287,12 @@ struct AgentStep: Identifiable, Codable, Equatable {
     let id: String
     let runID: String
     let seq: Int
+    /// Stable logical identity, e.g. `task-0/turn-1/tool-0`.
+    ///
+    /// Resume matches on this rather than on `seq`: a tool loop inserts steps
+    /// at a position that depends on what the model did last turn, so sequence
+    /// numbers shift between a first run and a replay.
+    var stepKey: String
     var kind: StepKind
     var state: StepState
     /// Request snapshot, JSON. Replayed verbatim when a run is resumed.
@@ -300,6 +306,7 @@ struct AgentStep: Identifiable, Codable, Equatable {
         id: String = UUID().uuidString,
         runID: String,
         seq: Int,
+        stepKey: String = "",
         kind: StepKind,
         state: StepState = .pending,
         payload: String,
@@ -311,6 +318,7 @@ struct AgentStep: Identifiable, Codable, Equatable {
         self.id = id
         self.runID = runID
         self.seq = seq
+        self.stepKey = stepKey
         self.kind = kind
         self.state = state
         self.payload = payload

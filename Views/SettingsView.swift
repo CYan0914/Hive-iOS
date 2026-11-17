@@ -58,9 +58,11 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(profile.name)
                             .font(.system(size: 15, weight: .medium))
-                        Text(profile.role)
+                        Text(profile.allowedTools.isEmpty
+                             ? "无工具"
+                             : profile.allowedTools.joined(separator: " · "))
                             .font(.caption2)
-                            .foregroundStyle(Theme.textSecondary)
+                            .foregroundStyle(profile.allowedTools.isEmpty ? Theme.textSecondary : Theme.accent)
                     }
                     .listRowBackground(Theme.surface)
                 }
