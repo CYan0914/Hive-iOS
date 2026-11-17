@@ -25,7 +25,7 @@ enum PlanParser {
             return nil
         }
 
-        let known = Set(AgentProfile.builtins.map(\.id))
+        let known = Set(AgentProfile.all.map(\.id))
         var tasks: [PlannedTask] = []
 
         for item in rawTasks {

@@ -13,6 +13,7 @@ final class AppEnvironment: ObservableObject {
     @Published var activeProviderID: String?
     @Published var sessions: [ChatSession] = []
     @Published var currentSessionID: String?
+    @Published var customAgents: [AgentProfile] = []
     @Published var startupError: String?
 
     private let defaults = UserDefaults.standard
@@ -43,14 +44,29 @@ final class AppEnvironment: ObservableObject {
         self.startupError = error
 
         loadProviders()
+        loadCustomAgents()
         loadSessions()
         refreshEmbedder()
+    }
+
+    // MARK: - Custom agents
+
+    func loadCustomAgents() {
+        let agents = AgentProfile.loadCustom()
+        AgentProfile.custom = agents
+        customAgents = agents
+    }
+
+    func saveCustomAgents(_ agents: [AgentProfile]) {
+        AgentProfile.saveCustom(agents)
+        customAgents = agents
     }
 
     // MARK: - Lifecycle
 
     func bootstrap() {
         loadProviders()
+        loadCustomAgents()
         loadSessions()
         refreshEmbedder()
         orchestrator.resumeInterruptedIfNeeded()

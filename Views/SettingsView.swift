@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var env: AppEnvironment
     @State private var editing: ProviderConfig?
+    @State private var editingAgent: AgentProfile?
 
     var body: some View {
         List {
@@ -55,21 +56,43 @@ struct SettingsView: View {
 
             Section {
                 ForEach(AgentProfile.builtins) { profile in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(profile.name)
-                            .font(.system(size: 15, weight: .medium))
-                        Text(profile.allowedTools.isEmpty
-                             ? "无工具"
-                             : profile.allowedTools.joined(separator: " · "))
-                            .font(.caption2)
-                            .foregroundStyle(profile.allowedTools.isEmpty ? Theme.textSecondary : Theme.accent)
-                    }
-                    .listRowBackground(Theme.surface)
+                    agentRow(profile)
+                        .listRowBackground(Theme.surface)
                 }
+
+                ForEach(env.customAgents) { profile in
+                    Button {
+                        editingAgent = profile
+                    } label: {
+                        agentRow(profile)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Theme.surface)
+                    .swipeActions {
+                        Button("删除", role: .destructive) {
+                            env.saveCustomAgents(env.customAgents.filter { $0.id != profile.id })
+                        }
+                    }
+                }
+
+                Button {
+                    editingAgent = AgentProfile(
+                        id: UUID().uuidString,
+                        name: "新子机器人",
+                        role: "custom",
+                        summary: "",
+                        systemPrompt: "",
+                        isBuiltin: false,
+                        allowedTools: []
+                    )
+                } label: {
+                    Label("添加子机器人", systemImage: "plus")
+                }
+                .listRowBackground(Theme.surface)
             } header: {
                 Text("子机器人")
             } footer: {
-                Text("P1 内置三个，主管家会按任务自动派活。自定义子机器人在 P2。")
+                Text("内置三个不可编辑。自定义的会出现在管家的可选名单里。")
             }
 
             Section {
@@ -105,6 +128,27 @@ struct SettingsView: View {
             ProviderEditorView(config: config)
                 .environmentObject(env)
         }
+        .sheet(item: $editingAgent, onDismiss: { editingAgent = nil }) { profile in
+            AgentEditorView(profile: profile)
+                .environmentObject(env)
+        }
+    }
+
+    private func agentRow(_ profile: AgentProfile) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(profile.name)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Theme.textPrimary)
+            if !profile.summary.isEmpty {
+                Text(profile.summary)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            Text(profile.allowedTools.isEmpty ? "无工具" : profile.allowedTools.joined(separator: " · "))
+                .font(.caption2)
+                .foregroundStyle(profile.allowedTools.isEmpty ? Theme.textSecondary : Theme.accent)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var embeddingStatus: String {

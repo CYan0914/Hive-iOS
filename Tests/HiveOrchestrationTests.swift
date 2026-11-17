@@ -50,6 +50,23 @@ final class HiveOrchestrationTests: XCTestCase {
         XCTAssertEqual(PlanParser.parse(raw)?.tasks.count, 3)
     }
 
+    func testPlanParserAcceptsCustomAgent() {
+        let custom = AgentProfile(
+            id: "translator",
+            name: "翻译",
+            role: "custom",
+            summary: "把中文翻译成英文",
+            systemPrompt: "你是翻译。",
+            isBuiltin: false,
+            allowedTools: []
+        )
+        AgentProfile.custom = [custom]
+        defer { AgentProfile.custom = [] }
+
+        let plan = PlanParser.parse(#"{"tasks":[{"agent":"translator","instruction":"翻译这段话"}]}"#)
+        XCTAssertEqual(plan?.tasks.first?.agentID, "translator")
+    }
+
     func testPlanParserAssignsStableIDs() {
         let raw = #"{"tasks":[{"agent":"writer","instruction":"a"},{"agent":"critic","instruction":"b"}]}"#
         let first = PlanParser.parse(raw)

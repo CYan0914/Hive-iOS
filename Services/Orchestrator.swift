@@ -230,7 +230,15 @@ final class Orchestrator: ObservableObject {
                 streamToUI: true,
                 maxTurns: 3
             )
-            finish(direct, run: run, sessionID: sessionID, assistantMessageID: assistantMessageID, userText: userText)
+            finish(
+                direct,
+                run: run,
+                sessionID: sessionID,
+                assistantMessageID: assistantMessageID,
+                userText: userText,
+                provider: provider,
+                config: config
+            )
             return
         }
 
@@ -298,7 +306,15 @@ final class Orchestrator: ObservableObject {
             streamToUI: true
         )
 
-        finish(synthesis, run: run, sessionID: sessionID, assistantMessageID: assistantMessageID, userText: userText)
+        finish(
+            synthesis,
+            run: run,
+            sessionID: sessionID,
+            assistantMessageID: assistantMessageID,
+            userText: userText,
+            provider: provider,
+            config: config
+        )
     }
 
     // MARK: - Agent tool loop
@@ -357,7 +373,8 @@ final class Orchestrator: ObservableObject {
                     conversation.append(LLMMessage(
                         role: .tool,
                         content: result.output,
-                        toolCallID: call.id
+                        toolCallID: call.id,
+                        toolName: call.name
                     ))
                 }
             }
@@ -504,11 +521,21 @@ final class Orchestrator: ObservableObject {
         run: AgentRun,
         sessionID: String,
         assistantMessageID: String,
-        userText: String
+        userText: String,
+        provider: LLMProvider,
+        config: ProviderConfig
     ) {
         switch outcome {
         case .text(let text):
-            complete(run: run, sessionID: sessionID, assistantMessageID: assistantMessageID, output: text, userText: userText)
+            complete(
+                run: run,
+                sessionID: sessionID,
+                assistantMessageID: assistantMessageID,
+                output: text,
+                userText: userText,
+                provider: provider,
+                config: config
+            )
         case .interrupted:
             finishInterrupted(run: run, assistantMessageID: assistantMessageID, output: streamingText)
         case .failed(let message):
@@ -525,7 +552,9 @@ final class Orchestrator: ObservableObject {
         sessionID: String,
         assistantMessageID: String,
         output: String,
-        userText: String
+        userText: String,
+        provider: LLMProvider,
+        config: ProviderConfig
     ) {
         try? store.updateRunState(id: run.id, state: .completed)
         try? store.updateMessage(id: assistantMessageID, content: output, status: .complete)
@@ -537,12 +566,69 @@ final class Orchestrator: ObservableObject {
         isRunning = false
         activeRun = nil
 
+        // Memory work is off the critical path: the answer is already on
+        // screen. Episodic is the raw turn; semantic is the distilled version
+        // that survives across sessions.
         Task { [weak self] in
             guard let self else { return }
             await self.memory.remember(content: userText, layer: .episodic, sessionID: sessionID, importance: 0.4)
-            if !output.isEmpty {
-                await self.memory.remember(content: output, layer: .episodic, sessionID: sessionID, importance: 0.4)
+            guard !output.isEmpty else { return }
+            await self.memory.remember(content: output, layer: .episodic, sessionID: sessionID, importance: 0.4)
+            await self.distill(
+                userText: userText,
+                answer: output,
+                provider: provider,
+                config: config
+            )
+        }
+    }
+
+    /// Turns one turn into a few durable facts. Deliberately quiet: a failed
+    /// distillation leaves the turn's episodic memory intact and never surfaces
+    /// an error, because the user already got their answer.
+    private func distill(
+        userText: String,
+        answer: String,
+        provider: LLMProvider,
+        config: ProviderConfig
+    ) async {
+        let prompt = """
+        从下面这段对话里提炼最多 3 条值得长期记住的事实。
+
+        只保留：用户的稳定偏好、重要背景、明确结论。
+        不要保留：问候、过程描述、一次性的临时信息、助手自称做过的事。
+        每行一条，不要编号，不要解释。没有值得记住的就只输出：无
+
+        用户：\(userText)
+        助手：\(answer)
+        """
+
+        let request = LLMRequest(
+            model: config.model,
+            system: nil,
+            messages: [LLMMessage(role: .user, content: prompt)],
+            temperature: 0.2,
+            maxTokens: 300
+        )
+
+        var output = ""
+        do {
+            let stream = try await provider.stream(request)
+            for try await event in stream {
+                if case .text(let delta) = event {
+                    output += delta
+                }
             }
+        } catch {
+            return
+        }
+
+        for line in output.split(separator: "\n") {
+            let trimmed = line
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-•·0123456789. "))
+            guard trimmed.count >= 6, trimmed != "无", !trimmed.hasPrefix("无") else { continue }
+            await memory.remember(content: trimmed, layer: .semantic, sessionID: nil, importance: 0.6)
         }
     }
 
@@ -619,13 +705,17 @@ final class Orchestrator: ObservableObject {
     // MARK: - Prompts
 
     private func plannerPrompt() -> String {
-        """
+        // Built from the live roster so a user-authored agent is actually
+        // selectable, not just visible in settings.
+        let roster = AgentProfile.all
+            .map { "- \($0.id)：\($0.name)，\($0.summary)" }
+            .joined(separator: "\n")
+
+        return """
         你是 Hive 的主管家。把用户请求拆成 1-3 个可以独立执行的子任务。
 
         可用的子机器人（agent 字段只能填这些 id）：
-        - researcher：整理事实和信息，可以联网查资料
-        - writer：撰写和改写文字
-        - critic：挑错和给修改建议
+        \(roster)
 
         只输出一个 JSON 对象，不要输出任何其他文字：
         {"rationale":"一句话说明为什么这样拆","tasks":[{"agent":"researcher","instruction":"具体指令"}]}

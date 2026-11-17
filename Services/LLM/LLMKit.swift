@@ -14,6 +14,9 @@ struct LLMMessage: Codable, Equatable {
     let content: String
     /// Set on a `.tool` message: which call this is the result of.
     var toolCallID: String?
+    /// Gemini keys a tool result by function name rather than by call id, so
+    /// the name travels alongside the id instead of being recovered from it.
+    var toolName: String?
     /// Set on an `.assistant` message that asked for tools.
     var toolCalls: [ToolCall]
 
@@ -21,11 +24,13 @@ struct LLMMessage: Codable, Equatable {
         role: Role,
         content: String,
         toolCallID: String? = nil,
+        toolName: String? = nil,
         toolCalls: [ToolCall] = []
     ) {
         self.role = role
         self.content = content
         self.toolCallID = toolCallID
+        self.toolName = toolName
         self.toolCalls = toolCalls
     }
 }
@@ -190,6 +195,37 @@ enum ProviderSupport {
             return try url(cleaned, suffix: "/messages")
         }
         return try url(cleaned, suffix: "/v1/messages")
+    }
+
+    /// Tool arguments arrive as a JSON object whose values may be numbers or
+    /// booleans. Everything is flattened to strings because that is what the
+    /// tool interface takes; a lossless decode would need per-tool schemas.
+    static func parseArguments(_ raw: String) -> [String: String] {
+        guard let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        var result: [String: String] = [:]
+        for (key, value) in object {
+            if let string = value as? String {
+                result[key] = string
+            } else {
+                result[key] = String(describing: value)
+            }
+        }
+        return result
+    }
+
+    static func schemaDictionary(_ schema: ToolSchema) -> [String: Any] {
+        var properties: [String: Any] = [:]
+        for (key, value) in schema.properties {
+            properties[key] = ["type": value.type, "description": value.description]
+        }
+        return [
+            "type": schema.type,
+            "properties": properties,
+            "required": schema.required
+        ]
     }
 
     static func geminiModelName(_ raw: String) -> String {

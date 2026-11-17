@@ -201,6 +201,64 @@ final class AnthropicProvider: LLMProvider {
 
     var displayName: String { config.name }
 
+    // MARK: - Encoding
+
+    /// Anthropic expresses tool use as content blocks, not as a parallel
+    /// `tool_calls` field, and it rejects two consecutive user turns — so
+    /// several tool results have to be folded into one user message.
+    private static func encodedMessages(_ request: LLMRequest) -> [[String: Any]] {
+        var result: [[String: Any]] = []
+        let messages = request.messages
+        var index = 0
+
+        while index < messages.count {
+            let message = messages[index]
+
+            if message.role == .tool {
+                var blocks: [[String: Any]] = []
+                while index < messages.count, messages[index].role == .tool {
+                    let toolMessage = messages[index]
+                    blocks.append([
+                        "type": "tool_result",
+                        "tool_use_id": toolMessage.toolCallID ?? "",
+                        "content": toolMessage.content
+                    ])
+                    index += 1
+                }
+                result.append(["role": "user", "content": blocks])
+                continue
+            }
+
+            if message.role == .assistant, !message.toolCalls.isEmpty {
+                var blocks: [[String: Any]] = []
+                if !message.content.isEmpty {
+                    blocks.append(["type": "text", "text": message.content])
+                }
+                for call in message.toolCalls {
+                    blocks.append([
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments
+                    ])
+                }
+                result.append(["role": "assistant", "content": blocks])
+                index += 1
+                continue
+            }
+
+            if message.role != .system {
+                result.append([
+                    "role": message.role == .assistant ? "assistant" : "user",
+                    "content": message.content
+                ])
+            }
+            index += 1
+        }
+
+        return result
+    }
+
     func stream(_ request: LLMRequest) async throws -> AsyncThrowingStream<LLMEvent, Error> {
         let url = try ProviderSupport.anthropicURL(base: config.baseURL)
         var urlRequest = URLRequest(url: url)
@@ -212,9 +270,7 @@ final class AnthropicProvider: LLMProvider {
 
         // Anthropic takes system out of the messages array and has no `system`
         // role inside it.
-        let messages: [[String: Any]] = request.messages
-            .filter { $0.role != .system }
-            .map { ["role": $0.role == .assistant ? "assistant" : "user", "content": $0.content] }
+        let messages = AnthropicProvider.encodedMessages(request)
 
         var body: [String: Any] = [
             "model": request.model,
@@ -226,6 +282,15 @@ final class AnthropicProvider: LLMProvider {
         if let system = request.system, !system.isEmpty {
             body["system"] = system
         }
+        if !request.tools.isEmpty {
+            body["tools"] = request.tools.map { tool in
+                [
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": ProviderSupport.schemaDictionary(tool.schema)
+                ] as [String: Any]
+            }
+        }
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (bytes, response) = try await HTTPClient.session.bytes(for: urlRequest)
@@ -234,23 +299,57 @@ final class AnthropicProvider: LLMProvider {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    // Tool use streams as: content_block_start (id + name),
+                    // input_json_delta fragments, content_block_stop.
+                    var toolBlocks: [Int: (id: String, name: String, json: String)] = [:]
+
                     for try await event in SSE.events(from: bytes) {
-                        if event.name == "message_stop" {
-                            continuation.finish()
-                            return
-                        }
+                        if event.name == "message_stop" { break }
                         guard
                             let data = event.data.data(using: .utf8),
-                            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                            let type = object["type"] as? String
                         else { continue }
 
-                        if let type = object["type"] as? String,
-                           type == "content_block_delta",
-                           let delta = object["delta"] as? [String: Any],
-                           let text = delta["text"] as? String,
-                           !text.isEmpty {
-                            continuation.yield(.text(text))
+                        switch type {
+                        case "content_block_start":
+                            let blockIndex = object["index"] as? Int ?? 0
+                            if let block = object["content_block"] as? [String: Any],
+                               block["type"] as? String == "tool_use" {
+                                toolBlocks[blockIndex] = (
+                                    id: block["id"] as? String ?? "",
+                                    name: block["name"] as? String ?? "",
+                                    json: ""
+                                )
+                            }
+                        case "content_block_delta":
+                            guard let delta = object["delta"] as? [String: Any] else { continue }
+                            if let text = delta["text"] as? String, !text.isEmpty {
+                                continuation.yield(.text(text))
+                            }
+                            if delta["type"] as? String == "input_json_delta",
+                               let partial = delta["partial_json"] as? String {
+                                let blockIndex = object["index"] as? Int ?? 0
+                                if var block = toolBlocks[blockIndex] {
+                                    block.json += partial
+                                    toolBlocks[blockIndex] = block
+                                }
+                            }
+                        default:
+                            break
                         }
+                    }
+
+                    let calls = toolBlocks.keys.sorted().compactMap { key -> ToolCall? in
+                        guard let block = toolBlocks[key], !block.name.isEmpty else { return nil }
+                        return ToolCall(
+                            id: block.id.isEmpty ? UUID().uuidString : block.id,
+                            name: block.name,
+                            arguments: ProviderSupport.parseArguments(block.json)
+                        )
+                    }
+                    if !calls.isEmpty {
+                        continuation.yield(.toolCalls(calls))
                     }
                     continuation.finish()
                 } catch {
@@ -275,6 +374,68 @@ final class GeminiProvider: LLMProvider {
 
     var displayName: String { config.name }
 
+    // MARK: - Encoding
+
+    private static func encodedContents(_ request: LLMRequest) -> [[String: Any]] {
+        var result: [[String: Any]] = []
+
+        for message in request.messages where message.role != .system {
+            if message.role == .tool {
+                // Gemini keys the response by function name, which is why
+                // LLMMessage carries `toolName` separately from `toolCallID`.
+                result.append([
+                    "role": "user",
+                    "parts": [[
+                        "functionResponse": [
+                            "name": message.toolName ?? "",
+                            "response": ["result": message.content]
+                        ]
+                    ]]
+                ])
+                continue
+            }
+
+            if message.role == .assistant, !message.toolCalls.isEmpty {
+                var parts: [[String: Any]] = []
+                if !message.content.isEmpty {
+                    parts.append(["text": message.content])
+                }
+                for call in message.toolCalls {
+                    parts.append([
+                        "functionCall": [
+                            "name": call.name,
+                            "args": call.arguments
+                        ]
+                    ])
+                }
+                result.append(["role": "model", "parts": parts])
+                continue
+            }
+
+            result.append([
+                "role": message.role == .assistant ? "model" : "user",
+                "parts": [["text": message.content]]
+            ])
+        }
+
+        return result
+    }
+
+    private static func schemaDictionary(_ schema: ToolSchema) -> [String: Any] {
+        var properties: [String: Any] = [:]
+        for (key, value) in schema.properties {
+            properties[key] = [
+                "type": value.type.uppercased(),
+                "description": value.description
+            ]
+        }
+        return [
+            "type": schema.type.uppercased(),
+            "properties": properties,
+            "required": schema.required
+        ]
+    }
+
     func stream(_ request: LLMRequest) async throws -> AsyncThrowingStream<LLMEvent, Error> {
         let model = ProviderSupport.geminiModelName(request.model)
         guard !model.isEmpty else {
@@ -293,13 +454,7 @@ final class GeminiProvider: LLMProvider {
         urlRequest.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-        var contents: [[String: Any]] = []
-        for message in request.messages where message.role != .system {
-            contents.append([
-                "role": message.role == .assistant ? "model" : "user",
-                "parts": [["text": message.content]]
-            ])
-        }
+        let contents = GeminiProvider.encodedContents(request)
 
         var body: [String: Any] = [
             "contents": contents,
@@ -311,6 +466,17 @@ final class GeminiProvider: LLMProvider {
         if let system = request.system, !system.isEmpty {
             body["systemInstruction"] = ["parts": [["text": system]]]
         }
+        if !request.tools.isEmpty {
+            body["tools"] = [[
+                "functionDeclarations": request.tools.map { tool in
+                    [
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": GeminiProvider.schemaDictionary(tool.schema)
+                    ] as [String: Any]
+                }
+            ]]
+        }
         urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (bytes, response) = try await HTTPClient.session.bytes(for: urlRequest)
@@ -319,6 +485,8 @@ final class GeminiProvider: LLMProvider {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    var collectedCalls: [ToolCall] = []
+
                     for try await event in SSE.events(from: bytes) {
                         guard
                             let data = event.data.data(using: .utf8),
@@ -335,7 +503,23 @@ final class GeminiProvider: LLMProvider {
                             if let text = part["text"] as? String, !text.isEmpty {
                                 continuation.yield(.text(text))
                             }
+                            if let functionCall = part["functionCall"] as? [String: Any],
+                               let name = functionCall["name"] as? String, !name.isEmpty {
+                                let rawArguments = functionCall["args"] as? [String: Any] ?? [:]
+                                var arguments: [String: String] = [:]
+                                for (key, value) in rawArguments {
+                                    arguments[key] = value as? String ?? String(describing: value)
+                                }
+                                collectedCalls.append(ToolCall(
+                                    id: UUID().uuidString,
+                                    name: name,
+                                    arguments: arguments
+                                ))
+                            }
                         }
+                    }
+                    if !collectedCalls.isEmpty {
+                        continuation.yield(.toolCalls(collectedCalls))
                     }
                     continuation.finish()
                 } catch {
