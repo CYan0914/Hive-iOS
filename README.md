@@ -13,6 +13,7 @@
 - **稳定步骤键**：每一步有 `task-0/turn-1/tool-0` 这样的逻辑键。工具循环会改变一个回合产生多少行，所以恢复不能按序号匹配
 - **记忆提炼**：每轮回答结束后，用一个短请求把对话提炼成最多 3 条事实写进 `semantic` 层。提炼失败是静默的，不影响已经到手的回答
 - **自定义子机器人**：设置页可以新增，填名称、一句话描述、系统提示和工具权限。描述会进入管家的规划提示，所以自定义的也会被派活
+- **MCP 客户端**：连接 Streamable HTTP 传输的 MCP 服务，自动列出工具并注册为 `mcp_<服务名>_<工具名>`。stdio 传输不提供——iOS 无法启动子进程
 - **三层共享记忆 + 私有区**：`semantic`（全局事实）、`episodic`（会话情节）、`blackboard`（预留）、`scratchpad`（不参与检索）。按需检索 top-k 注入 system prompt，不是全量塞上下文
 - **混合 embedding**：远程 OpenAI 兼容 `/embeddings` → Apple `NLEmbedding` 端上模型 → 关键词 LIKE 兜底
 - **三家模型协议**：OpenAI 兼容 / Anthropic / Gemini，流式。Base URL 可填任意中转或自建服务
@@ -21,7 +22,8 @@
 
 ## 还没做（P3）
 
-- MCP / 快捷指令
+- MCP 的 stdio 传输与 OAuth；目前只支持 Streamable HTTP 和无需鉴权的服务
+- 快捷指令 / App Intents
 - 子机器人并行执行与事件总线（当前顺序执行，为 iOS 后台恢复的确定性让路）
 - 本地编排服务（Mac/PC 跑引擎，iPhone 只做 UI）
 - 记忆冲突消解：现在只追加，不判断新事实是否和旧事实矛盾

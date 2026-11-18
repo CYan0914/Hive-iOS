@@ -4,6 +4,7 @@ struct SettingsView: View {
     @EnvironmentObject private var env: AppEnvironment
     @State private var editing: ProviderConfig?
     @State private var editingAgent: AgentProfile?
+    @State private var editingServer: MCPServerConfig?
 
     var body: some View {
         List {
@@ -96,6 +97,54 @@ struct SettingsView: View {
             }
 
             Section {
+                ForEach(env.mcpServers) { server in
+                    Button {
+                        editingServer = server
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(server.name)
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(Theme.textPrimary)
+                                Text(server.url)
+                                    .font(.caption2)
+                                    .foregroundStyle(Theme.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Text(server.isEnabled ? "启用" : "停用")
+                                .font(.caption2)
+                                .foregroundStyle(server.isEnabled ? Theme.success : Theme.textSecondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Theme.surface)
+                    .swipeActions {
+                        Button("删除", role: .destructive) {
+                            env.saveMCPServers(env.mcpServers.filter { $0.id != server.id })
+                        }
+                    }
+                }
+
+                Button {
+                    editingServer = MCPServerConfig(name: "", url: "")
+                } label: {
+                    Label("添加 MCP 服务", systemImage: "plus")
+                }
+                .listRowBackground(Theme.surface)
+            } header: {
+                Text("MCP 服务")
+            } footer: {
+                if let error = env.mcpError {
+                    Text(error).foregroundStyle(Theme.danger)
+                } else if env.mcpTools.isEmpty {
+                    Text("Streamable HTTP 传输。连接成功后，工具会出现在子机器人的工具权限里。")
+                } else {
+                    Text("已加载 \(env.mcpTools.count) 个工具。")
+                }
+            }
+
+            Section {
                 HStack {
                     Text("向量检索")
                     Spacer()
@@ -130,6 +179,10 @@ struct SettingsView: View {
         }
         .sheet(item: $editingAgent, onDismiss: { editingAgent = nil }) { profile in
             AgentEditorView(profile: profile)
+                .environmentObject(env)
+        }
+        .sheet(item: $editingServer, onDismiss: { editingServer = nil }) { server in
+            MCPEditorView(config: server)
                 .environmentObject(env)
         }
     }

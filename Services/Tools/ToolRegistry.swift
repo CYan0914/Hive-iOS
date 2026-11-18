@@ -6,7 +6,14 @@ protocol AgentTool {
 }
 
 enum ToolRegistry {
-    static let all: [AgentTool] = [HTTPRequestTool(), WebTextTool()]
+    static let builtins: [AgentTool] = [HTTPRequestTool(), WebTextTool()]
+
+    /// Filled by AppEnvironment after it connects to the configured MCP
+    /// servers. Empty until then, which is also the correct default when the
+    /// user has configured none.
+    static var mcp: [AgentTool] = []
+
+    static var all: [AgentTool] { builtins + mcp }
 
     /// Permission is per-agent and lives on the profile. An agent with an empty
     /// list simply never sees the tools, which is the cheapest possible
@@ -18,6 +25,18 @@ enum ToolRegistry {
 
     static func find(_ name: String) -> AgentTool? {
         all.first { $0.definition.name == name }
+    }
+
+    /// Provider function names allow only `[A-Za-z0-9_-]` and are capped at 64
+    /// characters; a server whose name contains spaces must not produce a name
+    /// the API rejects at request time.
+    static func mcpToolName(server: MCPServerConfig, tool: String) -> String {
+        let raw = "mcp_\(server.name)_\(tool)"
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
+        let sanitized = String(raw.unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? Character(scalar) : "_"
+        })
+        return String(sanitized.prefix(64))
     }
 }
 

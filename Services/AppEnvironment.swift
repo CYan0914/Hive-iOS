@@ -14,6 +14,9 @@ final class AppEnvironment: ObservableObject {
     @Published var sessions: [ChatSession] = []
     @Published var currentSessionID: String?
     @Published var customAgents: [AgentProfile] = []
+    @Published var mcpServers: [MCPServerConfig] = []
+    @Published var mcpTools: [ToolDefinition] = []
+    @Published var mcpError: String?
     @Published var startupError: String?
 
     private let defaults = UserDefaults.standard
@@ -45,8 +48,55 @@ final class AppEnvironment: ObservableObject {
 
         loadProviders()
         loadCustomAgents()
+        loadMCPServers()
         loadSessions()
         refreshEmbedder()
+    }
+
+    // MARK: - MCP
+
+    func loadMCPServers() {
+        mcpServers = MCPServerConfig.load()
+    }
+
+    func saveMCPServers(_ servers: [MCPServerConfig]) {
+        mcpServers = servers
+        MCPServerConfig.save(servers)
+        Task { await reloadMCPTools() }
+    }
+
+    /// Connects to every enabled server and registers its tools. A server that
+    /// fails is reported but does not stop the others: one bad endpoint should
+    /// not cost the user their working tools.
+    func reloadMCPTools() async {
+        var adapters: [AgentTool] = []
+        var failure: String?
+
+        for server in mcpServers where server.isEnabled {
+            let client = MCPClient(config: server)
+            do {
+                try await client.initialize()
+                let remoteTools = try await client.listTools()
+                for tool in remoteTools {
+                    let name = ToolRegistry.mcpToolName(server: server, tool: tool.name)
+                    adapters.append(MCPToolAdapter(
+                        definition: ToolDefinition(
+                            name: name,
+                            description: "[\(server.name)] \(tool.description)",
+                            schema: tool.schema
+                        ),
+                        client: client,
+                        remoteName: tool.name
+                    ))
+                }
+            } catch {
+                failure = "\(server.name)：\(error.localizedDescription)"
+            }
+        }
+
+        ToolRegistry.mcp = adapters
+        mcpTools = adapters.map(\.definition)
+        mcpError = failure
     }
 
     // MARK: - Custom agents
@@ -67,9 +117,11 @@ final class AppEnvironment: ObservableObject {
     func bootstrap() {
         loadProviders()
         loadCustomAgents()
+        loadMCPServers()
         loadSessions()
         refreshEmbedder()
         orchestrator.resumeInterruptedIfNeeded()
+        Task { await reloadMCPTools() }
     }
 
     // MARK: - Providers
