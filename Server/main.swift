@@ -12,21 +12,30 @@ let port = UInt16(ProcessInfo.processInfo.environment["HIVE_PORT"] ?? "") ?? 878
 // look like a server that printed nothing.
 setvbuf(stdout, nil, _IONBF, 0)
 
-let state = MainActor.assumeIsolated { ServerState(port: port) }
+// Kept alive for the lifetime of the process. The listener belongs to the
+// state object, so releasing it would silently stop accepting connections.
+var retainedState: ServerState?
 
-do {
-    try state.start()
-    print("Hive server listening on http://127.0.0.1:\(port)")
-    print("  GET  /health")
-    print("  GET  /v1/sessions")
-    print("  POST /v1/message   {\"text\":\"...\",\"sessionID\":\"...\",\"providerID\":\"...\"}")
-    print("  GET  /v1/runs/latest")
-} catch {
-    FileHandle.standardError.write(Data("启动失败：\(error)\n".utf8))
-    exit(1)
+MainActor.assumeIsolated {
+    let state = ServerState(port: port)
+    retainedState = state
+
+    do {
+        try state.start()
+        print("Hive server listening on http://127.0.0.1:\(port)")
+        print("  GET  /health")
+        print("  GET  /v1/sessions")
+        print("  POST /v1/message   {\"text\":\"...\",\"sessionID\":\"...\",\"providerID\":\"...\"}")
+        print("  GET  /v1/runs/latest")
+    } catch {
+        FileHandle.standardError.write(Data("启动失败：\(error)\n".utf8))
+        exit(1)
+    }
 }
 
-RunLoop.main.run()
+withExtendedLifetime(retainedState) {
+    RunLoop.main.run()
+}
 
 // MARK: - Wiring
 
