@@ -7,6 +7,7 @@ options:
   bundleIdPrefix: com.cyan0914
   deploymentTarget:
     iOS: "17.0"
+    macOS: "13.0"
   minimumXcodeGenVersion: 2.40
   generateEmptyDirectories: true
   groupSortPosition: top
@@ -50,6 +51,24 @@ targets:
         SUPPORTS_MACCATALYST: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
 
+  # The local orchestration server. Same Models, Services and Keychain as the
+  # app; only the UI layer is absent. One engine, two surfaces.
+  HiveServer:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Server
+      - path: Models
+      - path: Services
+      - path: Core/Keychain.swift
+    dependencies:
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_NAME: HiveServer
+        PRODUCT_BUNDLE_IDENTIFIER: com.cyan0914.hive.server
+        GENERATE_INFOPLIST_FILE: YES
+
   HiveTests:
     type: bundle.unit-test
     platform: iOS
@@ -76,3 +95,10 @@ schemes:
         - HiveTests
     archive:
       config: Release
+
+  HiveServer:
+    build:
+      targets:
+        HiveServer: all
+    run:
+      config: Debug

@@ -45,6 +45,36 @@ xcodegen generate
 open Hive.xcodeproj
 ```
 
+## 本地编排服务（macOS）
+
+和 App 共用同一套 `Models` / `Services` / `Keychain`，只是没有 UI 层。同一个引擎，两种外壳。
+
+```sh
+xcodegen generate
+xcodebuild -project Hive.xcodeproj -scheme HiveServer -configuration Release build
+HIVE_PORT=8787 ./build/Release/HiveServer
+```
+
+端点：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 存活检查 |
+| GET | `/v1/sessions` | 会话列表 |
+| POST | `/v1/message` | `{"text":"...","sessionID":"...","providerID":"..."}`，立即返回 202 |
+| GET | `/v1/runs/latest` | 最新 run 的状态和所有步骤 |
+
+服务端和 App 读同一个 SQLite 文件（`~/Library/Application Support/Hive/hive.sqlite`），所以 App 里配置的模型、Key、会话都能直接复用。
+
+## TestFlight
+
+归档 job 已经写好，但有两个手动前置：
+
+1. **在 App Store Connect 网页创建 App 记录**，bundle id 填 `com.cyan0914.hive`。API 不能创建 App 记录，`POST /v1/apps` 不存在。
+2. 在仓库配置 secrets：`DIST_CERT_P12`、`DIST_CERT_PASSWORD`、`DIST_PROFILE`、`DIST_PROFILE_SPECIFIER`、`APPSTORE_KEY_ID`、`APPSTORE_ISSUER_ID`、`APPSTORE_API_KEY`。
+
+然后 Actions → **Build Hive** → Run workflow → `create_ipa=true`。
+
 ## 目录
 
 ```
